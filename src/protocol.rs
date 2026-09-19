@@ -75,9 +75,12 @@ impl FileTransferProtocol {
         let listener = TcpListener::bind("0.0.0.0:0").await?;
         let local_addr = listener.local_addr()?;
 
+        let local_ip = local_ip_address::local_ip()
+            .context("Failed to determine local IP address")?;
+
         println!("\nFile ready to send!");
         println!("Share this with the receiver:");
-        println!("  Address: /ip4/127.0.0.1/tcp/{}", local_addr.port());
+        println!("  Address: /ip4/{}/tcp/{}", local_ip, local_addr.port());
         println!();
 
         let file_data = std::fs::read(path)?;
