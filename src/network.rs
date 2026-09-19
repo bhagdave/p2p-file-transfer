@@ -6,6 +6,7 @@ use libp2p::{
     tcp,
     yamux,
     swarm::{Swarm, SwarmEvent},
+    core::upgrade::Version,
     Transport,
     Multiaddr,
     PeerId,
@@ -14,25 +15,10 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use futures::prelude::*;
 
-pub struct P2PNode {
-    swarm: Swarm<Behaviour>,
-    peer_id: PeerId,
-    tx: mpsc::Sender<NetworkEvent>,
-    rx: mpsc::Receiver<NetworkEvent>,
-}
-
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum NetworkEvent {
     PeerConnected(PeerId),
     PeerDisconnected(PeerId),
-    DataReceived {
-        peer_id: PeerId,
-        data: Vec<u8>,
-    },
-    DataSent {
-        peer_id: PeerId,
-        size: usize,
-    },
     Error(String),
 }
 
@@ -40,6 +26,13 @@ pub enum NetworkEvent {
 pub struct Behaviour {
     mdns: mdns::tokio::Behaviour,
     identify: libp2p::identify::Behaviour,
+}
+
+pub struct P2PNode {
+    pub swarm: Swarm<Behaviour>,
+    pub peer_id: PeerId,
+    pub tx: mpsc::Sender<NetworkEvent>,
+    pub rx: mpsc::Receiver<NetworkEvent>,
 }
 
 impl P2PNode {
@@ -50,7 +43,7 @@ impl P2PNode {
         let transport = tcp::tokio::Transport::new(tcp::Config::default());
 
         let upgrade_transport = transport
-            .upgrade(libp2p::core::upgrade::Version::V1)
+            .upgrade(Version::V1)
             .authenticate(noise::Config::new(&keypair).expect("noise config"))
             .multiplex(yamux::Config::default())
             .boxed();
@@ -68,7 +61,6 @@ impl P2PNode {
         let config = libp2p::swarm::Config::with_tokio_executor();
         let mut swarm = Swarm::new(upgrade_transport, behaviour, peer_id, config);
 
-        // Listen on all interfaces on a random port
         let listen_addr = Multiaddr::empty()
             .with(libp2p::multiaddr::Protocol::Ip4(std::net::Ipv4Addr::UNSPECIFIED))
             .with(libp2p::multiaddr::Protocol::Tcp(0));
@@ -97,49 +89,76 @@ impl P2PNode {
         Ok(())
     }
 
-    pub fn send_data(&mut self, _peer_id: PeerId, _data: Vec<u8>) -> Result<()> {
-        // TODO: Implement custom protocol for sending data
-        Ok(())
-    }
-
     pub async fn run(&mut self) -> Result<()> {
         loop {
             tokio::select! {
                 event = self.swarm.select_next_some() => {
-                    match event {
-                        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                            println!("Connected to peer: {}", peer_id);
-                            self.tx.send(NetworkEvent::PeerConnected(peer_id)).await.ok();
-                        }
-                        SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                            println!("Disconnected from peer: {}", peer_id);
-                            self.tx.send(NetworkEvent::PeerDisconnected(peer_id)).await.ok();
-                        }
-                        SwarmEvent::NewListenAddr { address, .. } => {
-                            println!("Listening on: {}", address);
-                        }
-                        SwarmEvent::ListenerError { listener_id, error, .. } => {
-                            println!("Listen error on listener {}: {}", listener_id, error);
-                        }
-                        SwarmEvent::Dialing { peer_id: Some(peer_id), .. } => {
-                            println!("Dialing peer: {}", peer_id);
-                        }
-                        SwarmEvent::Dialing { peer_id: None, .. } => {
-                            // Dialing without known peer
-                        }
-                        SwarmEvent::Behaviour(_event) => {
-                            // Handle behaviour events
-                            // TODO: Implement behaviour event handling
-                        }
-                        _ => {
-                            // Handle other event types
-                        }
-                    }
+                    self.handle_swarm_event(event).await;
                 }
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {
                     // Periodic check
                 }
             }
+        }
+    }
+
+    async fn handle_swarm_event(&mut self, event: SwarmEvent<BehaviourEvent>) {
+        match event {
+            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                println!("Connected to peer: {}", peer_id);
+                let _ = self.tx.send(NetworkEvent::PeerConnected(peer_id)).await;
+            }
+            SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                println!("Disconnected from peer: {}", peer_id);
+                let _ = self.tx.send(NetworkEvent::PeerDisconnected(peer_id)).await;
+            }
+            SwarmEvent::NewListenAddr { address, .. } => {
+                println!("Listening on: {}", address);
+            }
+            SwarmEvent::ListenerError { listener_id, error, .. } => {
+                println!("Listen error on listener {}: {}", listener_id, error);
+            }
+            SwarmEvent::Dialing { peer_id: Some(peer_id), .. } => {
+                println!("Dialing peer: {}", peer_id);
+            }
+            SwarmEvent::Dialing { peer_id: None, .. } => {
+                // Dialing without known peer
+            }
+            SwarmEvent::Behaviour(_event) => {
+                // Handle behaviour events
+            }
+            _ => {
+                // Handle other event types
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_network_event_creation() {
+        let peer_id = libp2p::PeerId::random();
+        let event = NetworkEvent::PeerConnected(peer_id);
+
+        match event {
+            NetworkEvent::PeerConnected(id) => assert_eq!(id, peer_id),
+            _ => panic!("Expected PeerConnected"),
+        }
+    }
+
+    #[test]
+    fn test_network_event_clone() {
+        let event1 = NetworkEvent::Error("test error".to_string());
+        let event2 = event1.clone();
+
+        match (event1, event2) {
+            (NetworkEvent::Error(e1), NetworkEvent::Error(e2)) => {
+                assert_eq!(e1, e2);
+            }
+            _ => panic!("Expected errors"),
         }
     }
 }

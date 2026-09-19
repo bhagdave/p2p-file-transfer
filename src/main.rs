@@ -16,17 +16,31 @@ async fn main() -> Result<()> {
 
     match cli.command {
         cli::Command::Send { file, .. } => {
+            let node = P2PNode::new().await?;
+            let addresses = node.listen_addresses();
+
+            println!("P2P File Transfer - Sender Mode");
+            println!("================================");
+            println!("Your listening addresses:");
+            for addr in addresses {
+                println!("  {}", addr);
+            }
+            println!();
+
             let passphrase = generate_passphrase();
             println!("Generated passphrase: {}", passphrase);
-            println!("Share this passphrase with the receiver.");
+            println!("Share the address(es) above and this passphrase with the receiver.");
+            println!();
 
-            let node = P2PNode::new().await?;
             let authenticator = Authenticator::new(passphrase);
             let mut protocol = FileTransferProtocol::new(node, authenticator);
 
             protocol.send_file(&file).await?;
         }
         cli::Command::Receive { address, passphrase } => {
+            println!("P2P File Transfer - Receiver Mode");
+            println!("==================================");
+
             let passphrase = match passphrase {
                 Some(p) => p,
                 None => {

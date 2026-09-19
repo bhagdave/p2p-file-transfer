@@ -1,14 +1,13 @@
 use anyhow::{Context, Result};
-use libp2p::{
-    PeerId,
-    Multiaddr,
-};
+use libp2p::PeerId;
 use std::{
     collections::HashMap,
     fs::File,
     io::{Read, Write},
     path::Path,
 };
+use tokio::net::{TcpStream, TcpListener};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use crate::network::P2PNode;
 use crate::auth::Authenticator;
@@ -42,11 +41,11 @@ pub struct TransferSession {
 }
 
 pub struct FileTransferProtocol {
-    node: P2PNode,
+    pub node: P2PNode,
     authenticator: Authenticator,
     sessions: HashMap<PeerId, TransferSession>,
     tx: mpsc::Sender<ProtocolEvent>,
-    rx: mpsc::Receiver<ProtocolEvent>,
+    pub rx: mpsc::Receiver<ProtocolEvent>,
 }
 
 #[derive(Debug)]
@@ -107,85 +106,123 @@ impl FileTransferProtocol {
         println!("Size: {} bytes", metadata.size);
         println!("Hash: {}", metadata.hash);
 
+        // Start listening on a random TCP port
+        let listener = TcpListener::bind("0.0.0.0:0").await?;
+        let local_addr = listener.local_addr()?;
+
+        println!("\nFile ready to send!");
+        println!("Share this with the receiver:");
+        println!("  Address: /ip4/127.0.0.1/tcp/{}", local_addr.port());
+        println!();
+
+        let mut node_for_run = P2PNode::new().await?;
+        tokio::spawn(async move {
+            let _ = node_for_run.run().await;
+        });
+
+        let file_data = std::fs::read(path)?;
+        let metadata_clone = metadata.clone();
+
         println!("Waiting for receiver to connect...");
-        let peer_id = self.wait_for_peer().await?;
 
-        self.authenticate_with_peer(peer_id).await?;
+        let (mut socket, peer_addr) = listener.accept().await?;
+        println!("Receiver connected from: {}", peer_addr);
 
-        self.send_metadata(peer_id, &metadata).await?;
+        // Auth
+        println!("Authenticating receiver...");
+        let challenge = self.authenticator.generate_challenge();
+        socket.write_all(&challenge).await?;
 
-        self.send_file_data(peer_id, path, &metadata).await?;
+        let mut response = vec![0u8; 32];
+        socket.read_exact(&mut response).await?;
 
+        if !self.authenticator.verify_response(&challenge, &response) {
+            println!("Authentication failed - rejecting connection");
+            return Err(anyhow::anyhow!("Authentication failed"));
+        }
+        println!("Authentication successful!");
+
+        let metadata_json = serde_json::to_string(&metadata_clone)?;
+        let mut msg = (metadata_json.len() as u32).to_le_bytes().to_vec();
+        msg.extend(metadata_json.as_bytes());
+        socket.write_all(&msg).await?;
+
+        println!("Sending file data...");
+        socket.write_all(&(file_data.len() as u64).to_le_bytes()).await?;
+        socket.write_all(&file_data).await?;
+
+        println!("File sent! {} bytes transferred", file_data.len());
         println!("Transfer complete!");
         Ok(())
     }
 
     pub async fn receive_file(&mut self, sender_address: &str) -> Result<()> {
-        let address: Multiaddr = sender_address
-            .parse()
-            .context("Invalid address format")?;
-
         println!("Connecting to sender...");
-        self.node.connect_to(&address)?;
 
-        let peer_id = self.wait_for_peer().await?;
+        let parts: Vec<&str> = sender_address.split('/').collect();
+        let ip = if parts.len() > 2 { parts[2] } else { "127.0.0.1" };
+        let port_str = if parts.len() > 4 { parts[4] } else { "9000" };
+        let port: u16 = port_str.parse()?;
 
-        self.authenticate_with_peer(peer_id).await?;
+        let target_addr = format!("{}:{}", ip, port);
 
-        let metadata = self.receive_metadata(peer_id).await?;
+        let mut socket = TcpStream::connect(&target_addr).await
+            .context(format!("Failed to connect to {}", target_addr))?;
+
+        println!("Connected to sender at {}", target_addr);
+
+        let mut size_buf = [0u8; 4];
+        socket.read_exact(&mut size_buf).await?;
+        let metadata_size = u32::from_le_bytes(size_buf) as usize;
+
+        let mut metadata_buf = vec![0u8; metadata_size];
+        socket.read_exact(&mut metadata_buf).await?;
+
+        let metadata: FileMetadata = serde_json::from_slice(&metadata_buf)?;
+
+        // prevent path traversal attacks
+        let safe_name = Path::new(&metadata.name)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| anyhow::anyhow!("Invalid filename"))?;
+
+        if safe_name.starts_with('.') || safe_name.contains("..") {
+            return Err(anyhow::anyhow!("Invalid filename: path traversal detected"));
+        }
+
+        let downloads_dir = Path::new("./downloads");
+        std::fs::create_dir_all(downloads_dir)?;
+        let out_path = downloads_dir.join(safe_name);
+
         println!("Receiving: {}", metadata.name);
         println!("Size: {} bytes", metadata.size);
+        println!("Saving to: {}", out_path.display());
 
-        self.receive_file_data(peer_id, &metadata).await?;
+        let mut file_size_buf = [0u8; 8];
+        socket.read_exact(&mut file_size_buf).await?;
+        let file_size = u64::from_le_bytes(file_size_buf) as usize;
 
+        let mut file_data = vec![0u8; file_size];
+        let mut total_read = 0;
+
+        println!("Receiving file data...");
+        while total_read < file_size {
+            let n = socket.read(&mut file_data[total_read..]).await?;
+            if n == 0 {
+                break;
+            }
+            total_read += n;
+
+            let progress = (total_read as f64 / file_size as f64) * 100.0;
+            println!("Progress: {:.2}% ({}/{})", progress, total_read, file_size);
+        }
+
+        let mut file = File::create(&out_path)?;
+        file.write_all(&file_data)?;
+
+        println!("File received! {} bytes written to {}", file_data.len(), out_path.display());
         println!("Transfer complete!");
         Ok(())
-    }
-
-    async fn wait_for_peer(&mut self) -> Result<PeerId> {
-        loop {
-            match self.rx.recv().await {
-                Some(ProtocolEvent::AuthChallenge { peer_id, .. }) => {
-                    return Ok(peer_id);
-                }
-                _ => continue,
-            }
-        }
-    }
-
-    async fn authenticate_with_peer(&mut self, peer_id: PeerId) -> Result<()> {
-        println!("Authenticating with peer...");
-
-        let challenge = self.authenticator.generate_challenge();
-        self.send_auth_challenge(peer_id, &challenge).await?;
-
-        let response = self.wait_for_auth_response(peer_id).await?;
-
-        if self.authenticator.verify_response(&challenge, &response) {
-            println!("Authentication successful!");
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!("Authentication failed"))
-        }
-    }
-
-    async fn send_auth_challenge(&mut self, _peer_id: PeerId, _challenge: &[u8]) -> Result<()> {
-        // TODO: Implement custom protocol for auth challenge
-        Ok(())
-    }
-
-    async fn wait_for_auth_response(&mut self, peer_id: PeerId) -> Result<Vec<u8>> {
-        loop {
-            match self.rx.recv().await {
-                Some(ProtocolEvent::AuthResponse {
-                    peer_id: received_id,
-                    response,
-                }) if received_id == peer_id => {
-                    return Ok(response);
-                }
-                _ => continue,
-            }
-        }
     }
 
     async fn compute_file_metadata(&self, path: &Path) -> Result<FileMetadata> {
@@ -213,106 +250,6 @@ impl FileTransferProtocol {
         let result = hasher.finalize();
 
         Ok(hex::encode(result))
-    }
-
-    async fn send_metadata(&mut self, peer_id: PeerId, metadata: &FileMetadata) -> Result<()> {
-        let json = serde_json::to_string(metadata)?;
-        let data = json.into_bytes();
-        self.node.send_data(peer_id, data)?;
-        Ok(())
-    }
-
-    async fn receive_metadata(&mut self, peer_id: PeerId) -> Result<FileMetadata> {
-        loop {
-            match self.rx.recv().await {
-                Some(ProtocolEvent::FileMetadata {
-                    peer_id: received_id,
-                    metadata,
-                }) if received_id == peer_id => {
-                    return Ok(metadata);
-                }
-                _ => continue,
-            }
-        }
-    }
-
-    async fn send_file_data(
-        &mut self,
-        peer_id: PeerId,
-        path: &Path,
-        metadata: &FileMetadata,
-    ) -> Result<()> {
-        let mut file = File::open(path)?;
-        let mut buffer = [0u8; 65536]; // 64KB chunks
-        let mut total_sent: u64 = 0;
-
-        loop {
-            let bytes_read = file.read(&mut buffer)?;
-            if bytes_read == 0 {
-                break;
-            }
-
-            let chunk = &buffer[..bytes_read];
-            self.node.send_data(peer_id, chunk.to_vec())?;
-
-            total_sent += bytes_read as u64;
-
-            let progress = (total_sent as f64 / metadata.size as f64) * 100.0;
-            println!(
-                "Sending: {:.2}% ({}/{} bytes)",
-                progress, total_sent, metadata.size
-            );
-        }
-
-        self.node.send_data(peer_id, vec![])?;
-        Ok(())
-    }
-
-    async fn receive_file_data(
-        &mut self,
-        peer_id: PeerId,
-        metadata: &FileMetadata,
-    ) -> Result<()> {
-        let mut file = File::create(&metadata.name)?;
-        let mut total_received: u64 = 0;
-
-        loop {
-            match self.rx.recv().await {
-                Some(ProtocolEvent::FileChunk {
-                    peer_id: received_id,
-                    chunk,
-                    ..
-                }) if received_id == peer_id => {
-                    if chunk.is_empty() {
-                        break;
-                    }
-
-                    file.write_all(&chunk)?;
-                    total_received += chunk.len() as u64;
-
-                    let progress = (total_received as f64 / metadata.size as f64) * 100.0;
-                    println!(
-                        "Receiving: {:.2}% ({}/{} bytes)",
-                        progress, total_received, metadata.size
-                    );
-                }
-                _ => continue,
-            }
-        }
-
-        // Verify file hash
-        let received_hash = self.compute_file_hash(Path::new(&metadata.name)).await?;
-        if received_hash == metadata.hash {
-            println!("File hash verified!");
-        } else {
-            return Err(anyhow::anyhow!(
-                "File hash mismatch: expected {}, got {}",
-                metadata.hash,
-                received_hash
-            ));
-        }
-
-        Ok(())
     }
 }
 
