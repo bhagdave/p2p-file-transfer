@@ -1,28 +1,13 @@
 use anyhow::{Context, Result};
 use libp2p::PeerId;
 use std::{
-    collections::HashMap,
     fs::File,
     io::{Read, Write},
     path::Path,
 };
 use tokio::net::{TcpStream, TcpListener};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
-use crate::network::P2PNode;
 use crate::auth::Authenticator;
-
-#[derive(Debug)]
-pub enum TransferState {
-    Idle,
-    Authenticating,
-    SendingMetadata,
-    SendingData,
-    ReceivingMetadata,
-    ReceivingData,
-    Complete,
-    Error(String),
-}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FileMetadata {
@@ -31,21 +16,8 @@ pub struct FileMetadata {
     pub hash: String,
 }
 
-#[derive(Debug)]
-pub struct TransferSession {
-    pub peer_id: PeerId,
-    pub state: TransferState,
-    pub metadata: Option<FileMetadata>,
-    pub bytes_sent: u64,
-    pub bytes_received: u64,
-}
-
 pub struct FileTransferProtocol {
-    pub node: P2PNode,
     authenticator: Authenticator,
-    sessions: HashMap<PeerId, TransferSession>,
-    tx: mpsc::Sender<ProtocolEvent>,
-    pub rx: mpsc::Receiver<ProtocolEvent>,
 }
 
 #[derive(Debug)]
@@ -84,15 +56,8 @@ pub enum ProtocolEvent {
 }
 
 impl FileTransferProtocol {
-    pub fn new(node: P2PNode, authenticator: Authenticator) -> Self {
-        let (tx, rx) = mpsc::channel(100);
-        Self {
-            node,
-            authenticator,
-            sessions: HashMap::new(),
-            tx,
-            rx,
-        }
+    pub fn new(authenticator: Authenticator) -> Self {
+        Self { authenticator }
     }
 
     pub async fn send_file(&mut self, file_path: &str) -> Result<()> {
@@ -114,11 +79,6 @@ impl FileTransferProtocol {
         println!("Share this with the receiver:");
         println!("  Address: /ip4/127.0.0.1/tcp/{}", local_addr.port());
         println!();
-
-        let mut node_for_run = P2PNode::new().await?;
-        tokio::spawn(async move {
-            let _ = node_for_run.run().await;
-        });
 
         let file_data = std::fs::read(path)?;
         let metadata_clone = metadata.clone();
@@ -298,66 +258,6 @@ mod tests {
         assert_eq!(metadata.hash.len(), 64);
     }
 
-    #[test]
-    fn test_transfer_state_variants() {
-        let idle = TransferState::Idle;
-        let complete = TransferState::Complete;
-        let error = TransferState::Error("connection lost".to_string());
-
-        match error {
-            TransferState::Error(msg) => assert_eq!(msg, "connection lost"),
-            _ => panic!("Expected error state"),
-        }
-
-        match idle {
-            TransferState::Idle => (),
-            _ => panic!("Expected idle state"),
-        }
-
-        match complete {
-            TransferState::Complete => (),
-            _ => panic!("Expected complete state"),
-        }
-    }
-
-    #[test]
-    fn test_transfer_session_creation() {
-        let peer_id = libp2p::PeerId::random();
-        let session = TransferSession {
-            peer_id,
-            state: TransferState::Idle,
-            metadata: None,
-            bytes_sent: 0,
-            bytes_received: 0,
-        };
-
-        assert_eq!(session.peer_id, peer_id);
-        assert_eq!(session.bytes_sent, 0);
-        assert_eq!(session.bytes_received, 0);
-        assert!(session.metadata.is_none());
-    }
-
-    #[test]
-    fn test_transfer_session_with_metadata() {
-        let peer_id = libp2p::PeerId::random();
-        let metadata = FileMetadata {
-            name: "large_file.bin".to_string(),
-            size: 10_000_000,
-            hash: "hash_value".to_string(),
-        };
-
-        let session = TransferSession {
-            peer_id,
-            state: TransferState::SendingData,
-            metadata: Some(metadata.clone()),
-            bytes_sent: 5_000_000,
-            bytes_received: 0,
-        };
-
-        assert_eq!(session.bytes_sent, 5_000_000);
-        assert!(session.metadata.is_some());
-        assert_eq!(session.metadata.unwrap().size, 10_000_000);
-    }
 
     #[test]
     fn test_protocol_event_auth_challenge() {
@@ -397,13 +297,6 @@ mod tests {
             }
             _ => panic!("Expected FileMetadata event"),
         }
-    }
-
-    #[test]
-    fn test_transfer_state_debug() {
-        let state = TransferState::SendingMetadata;
-        let debug_str = format!("{:?}", state);
-        assert!(debug_str.contains("SendingMetadata"));
     }
 
     #[test]

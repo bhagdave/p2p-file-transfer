@@ -9,7 +9,6 @@ mod auth;
 use anyhow::Result;
 use clap::Parser;
 use cli::Cli;
-use network::P2PNode;
 use protocol::FileTransferProtocol;
 use auth::Authenticator;
 
@@ -19,24 +18,16 @@ async fn main() -> Result<()> {
 
     match cli.command {
         cli::Command::Send { file, .. } => {
-            let node = P2PNode::new().await?;
-            let addresses = node.listen_addresses();
-
             println!("P2P File Transfer - Sender Mode");
             println!("================================");
-            println!("Your listening addresses:");
-            for addr in addresses {
-                println!("  {}", addr);
-            }
-            println!();
 
             let passphrase = generate_passphrase();
             println!("Generated passphrase: {}", passphrase);
-            println!("Share the address(es) above and this passphrase with the receiver.");
+            println!("Share this passphrase with the receiver.");
             println!();
 
             let authenticator = Authenticator::new(passphrase);
-            let mut protocol = FileTransferProtocol::new(node, authenticator);
+            let mut protocol = FileTransferProtocol::new(authenticator);
 
             protocol.send_file(&file).await?;
         }
@@ -52,9 +43,8 @@ async fn main() -> Result<()> {
                 }
             };
 
-            let node = P2PNode::new().await?;
             let authenticator = Authenticator::new(passphrase);
-            let mut protocol = FileTransferProtocol::new(node, authenticator);
+            let mut protocol = FileTransferProtocol::new(authenticator);
 
             protocol.receive_file(&address).await?;
         }
