@@ -160,16 +160,28 @@ impl FileTransferProtocol {
         println!("Connecting to sender...");
 
         let parts: Vec<&str> = sender_address.split('/').collect();
-        let ip = if parts.len() > 2 { parts[2] } else { "127.0.0.1" };
-        let port_str = if parts.len() > 4 { parts[4] } else { "9000" };
-        let port: u16 = port_str.parse()?;
+        if parts.len() < 5 {
+            return Err(anyhow::anyhow!("Invalid address format. Expected: /ip4/IP/tcp/PORT"));
+        }
+        let ip = parts[2];
+        let port: u16 = parts[4].parse()
+            .context("Invalid port number")?;
 
         let target_addr = format!("{}:{}", ip, port);
 
         let mut socket = TcpStream::connect(&target_addr).await
-            .context(format!("Failed to connect to {}", target_addr))?;
+            .context(format!("Failed to connect to {}. Is sender running?", target_addr))?;
 
         println!("Connected to sender at {}", target_addr);
+
+        // Authenticate with sender
+        println!("Authenticating...");
+        let mut challenge = vec![0u8; 32];
+        socket.read_exact(&mut challenge).await?;
+
+        let response = self.authenticator.generate_response(&challenge);
+        socket.write_all(&response).await?;
+        println!("Authentication sent!");
 
         let mut size_buf = [0u8; 4];
         socket.read_exact(&mut size_buf).await?;
